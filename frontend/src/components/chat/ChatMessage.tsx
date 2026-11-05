@@ -52,7 +52,7 @@ export default function ChatMessage({ message, onRegenerate, isLatestAssistant, 
       <div className="message-content">
         <div className="message-author">{assistant ? "Inkwell" : "You"}</div>
         {message.streaming && !message.content ? (
-          <div className="typing-indicator"><i /><i /><i /><span>Thinking through your documents</span></div>
+          <div className="typing-indicator"><i /><i /><i /><span>{message.status ?? "Thinking through your documents"}</span></div>
         ) : assistant ? (
           <div className="markdown-body">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>

@@ -1,0 +1,22 @@
+services:
+  backend:
+    build: ./backend
+    env_file: ./backend/.env
+    environment:
+      CORS_ORIGINS: http://localhost:8080
+    volumes:
+      - rag-data:/app/data
+      # Optional per-app agent config (assistant names, instructions, app tools):
+      # - ./backend/agent_config.json:/app/agent_config.json:ro
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  rag-data:

@@ -101,11 +101,19 @@ def delete_document(
     response_model=DocumentResponse,
     dependencies=[Depends(require_admin)],
 )
-def reprocess_document(
-    document_id: str,
-    request: Request,
-):
-    document = request.app.state.document_service.reprocess(document_id)
-    if document is None:
+def reprocess_document(document_id: str, request: Request, background_tasks: BackgroundTasks):
+    database = request.app.state.database
+    if database.get_document(document_id) is None:
         raise HTTPException(status_code=404, detail="Document not found.")
-    return document
+    database.update_document(document_id, status="processing", error=None)
+    background_tasks.add_task(request.app.state.document_service.process_document, document_id)
+    return database.get_document(document_id)
+
+
+@router.post("/reindex", dependencies=[Depends(require_admin)])
+def reindex_all_documents(request: Request, background_tasks: BackgroundTasks):
+    """Re-chunk and re-embed every document, e.g. after changing chunk size or embedding model."""
+    service = request.app.state.document_service
+    ids = service.mark_all_for_reindex()
+    background_tasks.add_task(service.process_many, ids)
+    return {"queued": len(ids)}

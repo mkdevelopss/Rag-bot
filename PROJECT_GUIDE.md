@@ -133,7 +133,7 @@ EmbeddingService embeds the question -> VectorStore searches ChromaDB
 RagPipeline builds bounded context and source records
         |
         v
-LLMService streams a response from Gemini or Groq
+LLMClient streams a response from Groq, Gemini or OpenAI (agent mode may first call tools)
         |
         v
 chat.py emits sources, text deltas, and completion events
@@ -184,7 +184,11 @@ If `SETTINGS_PASSWORD_HASH` is empty, the key-generation CLI asks you to create 
 | [`backend/app/services/chunking.py`](backend/app/services/chunking.py) | `TextChunk` represents a passage and its metadata. `chunk_text()` divides text into overlapping passages while retaining source page information. |
 | [`backend/app/services/embeddings.py`](backend/app/services/embeddings.py) | `EmbeddingService` lazily loads the local Sentence Transformers model; `embed_texts()` batches document passages and `embed_query()` embeds a search question. |
 | [`backend/app/services/vector_store.py`](backend/app/services/vector_store.py) | `VectorStore` manages persistent ChromaDB. `add_chunks()` indexes passages; `search()` retrieves nearest matches; delete/count/availability methods support document management and retrieval. |
-| [`backend/app/services/rag_pipeline.py`](backend/app/services/rag_pipeline.py) | `is_greeting()` and `no_context_answer()` provide conversational and missing-context responses. `RagPipeline.retrieve()` searches and filters passages; `build_prompt()` assembles grounded context. `LLMService` configures the selected provider, maps provider errors, and streams generated text. |
+| [`backend/app/services/rag_pipeline.py`](backend/app/services/rag_pipeline.py) | `is_greeting()` and `no_context_answer()` provide conversational and missing-context responses. `RagPipeline.search()` runs hybrid vector + BM25 search; `retrieve()` builds numbered context for classic RAG; `rewrite_query()` turns follow-ups into standalone queries. |
+| [`backend/app/services/llm.py`](backend/app/services/llm.py) | `LLMClient`: one OpenAI-compatible client for Groq, Gemini and OpenAI, with streaming, tool-call assembly, retries and error mapping. |
+| [`backend/app/services/agent.py`](backend/app/services/agent.py) / [`tools.py`](backend/app/services/tools.py) | Tool-calling agent loop, built-in knowledge-base tools, per-namespace HTTP tools from `agent_config.json`. |
+| [`backend/app/services/chat_service.py`](backend/app/services/chat_service.py) | One chat flow for the web UI and the service API: preparation, caching, agent/classic routing, persistence. |
+| [`backend/app/api/routes/service_api.py`](backend/app/api/routes/service_api.py) | `/api/v1/namespaces/{ns}/...` server-to-server API (see INTEGRATION.md). |
 | [`backend/app/services/database.py`](backend/app/services/database.py) | `Database` owns SQLite connections and schema migration. It persists browser users, hashed sessions, login lockouts, versioned shared document metadata, user-owned conversation/message history, and setting overrides. There is no ORM layer. |
 | [`backend/app/services/runtime_settings.py`](backend/app/services/runtime_settings.py) | `RuntimeSettings` combines base environment settings with SQLite overrides. It safely updates provider settings and persists provider keys in `.env`. |
 | [`backend/app/services/settings_security.py`](backend/app/services/settings_security.py) | `hash_settings_password()` creates salted PBKDF2 hashes. `SettingsAuth` verifies the password, issues time-limited tokens, authorizes changes, and revokes tokens. |

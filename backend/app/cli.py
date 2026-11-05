@@ -85,14 +85,37 @@ def generate_admin_key() -> int:
     return 0
 
 
+def generate_service_key_command(name: str, namespaces: str) -> int:
+    from app.services.service_auth import generate_service_key, hash_service_key
+
+    if not name or ":" in name or "," in name:
+        print("--name is required and cannot contain ':' or ','.", file=sys.stderr)
+        return 1
+    if ":" in namespaces or "," in namespaces:
+        print("--namespaces is one glob such as 'marketbid' or 'distos-*'.", file=sys.stderr)
+        return 1
+    key = generate_service_key()
+    entry = f"{name}:{hash_service_key(key)}:{namespaces}"
+    print("Service API key (store it in the calling app's secrets; it is shown once):")
+    print(key)
+    print()
+    print("Append this entry to SERVICE_API_KEYS in backend/.env (comma-separated), then restart:")
+    print(entry)
+    return 0
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Inkwell account administration")
-    parser.add_argument("command", choices=["create-admin", "generate-admin-key"])
+    parser = argparse.ArgumentParser(description="Inkwell administration")
+    parser.add_argument("command", choices=["create-admin", "generate-admin-key", "generate-service-key"])
+    parser.add_argument("--name", default="", help="Service key name, e.g. marketbid")
+    parser.add_argument("--namespaces", default="*", help="Namespace glob the key may access")
     args = parser.parse_args()
     if args.command == "create-admin":
         return create_admin()
     if args.command == "generate-admin-key":
         return generate_admin_key()
+    if args.command == "generate-service-key":
+        return generate_service_key_command(args.name, args.namespaces)
     return 2
 
 

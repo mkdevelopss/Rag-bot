@@ -10,6 +10,7 @@ import Sidebar from "./components/layout/Sidebar";
 import SettingsPanel from "./components/ui/SettingsPanel";
 import { api, messageFromHistory, streamChat, uploadFiles } from "./services/api";
 import type {
+  Provider,
   AppSettings, AuthStatus, Conversation, DocumentRecord, Message, Source, UserRecord,
 } from "./types";
 
@@ -317,6 +318,10 @@ function Workspace({
           const sources = data.sources as Source[];
           setMessages((current) => current.map((item, index) =>
             index === assistantIndex ? { ...item, sources } : item));
+        } else if (event === "status" && typeof data.message === "string") {
+          const status = data.message;
+          setMessages((current) => current.map((item, index) =>
+            index === assistantIndex ? { ...item, status } : item));
         } else if (event === "delta" && typeof data.text === "string") {
           setMessages((current) => current.map((item, index) =>
             index === assistantIndex ? { ...item, content: item.content + data.text } : item));
@@ -419,7 +424,7 @@ function Workspace({
 
   async function saveProviderSettings(
     token: string,
-    provider: "gemini" | "groq",
+    provider: Provider,
     apiKey: string,
     model: string,
   ) {

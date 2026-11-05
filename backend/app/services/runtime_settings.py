@@ -18,25 +18,21 @@ class RuntimeSettings:
         return self.current
 
     def update_provider(self, provider: str, api_key: str | None, model: str) -> Settings:
-        existing_key = (
-            self.current.gemini_api_key if provider == "gemini" else self.current.groq_api_key
-        )
+        if provider not in {"gemini", "groq", "openai"}:
+            raise ValueError(f"Unsupported provider '{provider}'.")
+        existing_key = getattr(self.current, f"{provider}_api_key")
         api_key = api_key.strip() if api_key else existing_key
         if not api_key:
             raise ValueError(f"Enter an API key for {provider.title()} before selecting it.")
-        key_name = "GEMINI_API_KEY" if provider == "gemini" else "GROQ_API_KEY"
-        model_name = "GEMINI_MODEL" if provider == "gemini" else "GROQ_MODEL"
         updates = {
             "LLM_PROVIDER": provider,
-            key_name: api_key,
-            model_name: model,
+            f"{provider.upper()}_API_KEY": api_key,
+            f"{provider.upper()}_MODEL": model,
         }
         fields = {
             "llm_provider": provider,
-            "gemini_api_key": api_key if provider == "gemini" else self.current.gemini_api_key,
-            "gemini_model": model if provider == "gemini" else self.current.gemini_model,
-            "groq_api_key": api_key if provider == "groq" else self.current.groq_api_key,
-            "groq_model": model if provider == "groq" else self.current.groq_model,
+            f"{provider}_api_key": api_key,
+            f"{provider}_model": model,
         }
         candidate = self.current.model_copy(update=fields)
         self.write_env_updates(updates)

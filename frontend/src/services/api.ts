@@ -1,4 +1,5 @@
 import type {
+  Provider,
   AppSettings, AuthStatus, Conversation, DocumentRecord, EmployeeCreated, Message, UserRecord,
 } from "../types";
 
@@ -77,7 +78,7 @@ export const api = {
   health: () =>
     request<{
       status: string;
-      llm_provider: "gemini" | "groq";
+      llm_provider: Provider;
       llm_model: string;
       llm_configured: boolean;
     }>("/health"),
@@ -116,7 +117,7 @@ export const api = {
     }),
   saveProviderSettings: (
     token: string,
-    provider: "gemini" | "groq",
+    provider: Provider,
     apiKey: string,
     model: string,
   ) =>

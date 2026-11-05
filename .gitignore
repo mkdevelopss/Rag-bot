@@ -5,7 +5,7 @@ __pycache__/
 .pytest_cache/
 backend/data/uploads/*
 backend/data/chroma_db/*
-backend/data/*.sqlite3
+backend/data/*.sqlite3*
 !backend/data/uploads/.gitkeep
 !backend/data/chroma_db/.gitkeep
 frontend/node_modules/
