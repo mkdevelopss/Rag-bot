@@ -32,6 +32,8 @@ class Database:
 
     def initialize(self) -> None:
         with self.connect() as connection:
+            # WAL lets readers and the ingestion writer work at the same time.
+            connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS documents (
@@ -114,6 +116,28 @@ class Database:
                 connection.execute(
                     "ALTER TABLE documents ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"
                 )
+            if "namespace" not in document_columns:
+                connection.execute(
+                    "ALTER TABLE documents ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default'"
+                )
+            if "external_id" not in document_columns:
+                connection.execute("ALTER TABLE documents ADD COLUMN external_id TEXT")
+            if "namespace" not in conversation_columns:
+                connection.execute(
+                    "ALTER TABLE conversations ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default'"
+                )
+            if "external_user" not in conversation_columns:
+                connection.execute("ALTER TABLE conversations ADD COLUMN external_user TEXT")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS documents_namespace_idx ON documents(namespace, created_at)"
+            )
+            connection.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS documents_external_id_idx
+                ON documents(namespace, external_id) WHERE external_id IS NOT NULL"""
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS messages_conversation_idx ON messages(conversation_id, created_at)"
+            )
             connection.execute(
                 "UPDATE documents SET updated_at = created_at WHERE updated_at = ''"
             )
@@ -231,7 +255,8 @@ class Database:
             rows = connection.execute(
                 """SELECT user_id, email, display_name, role, is_active,
                 must_change_password, created_at, last_login_at
-                FROM users WHERE is_guest = 0 ORDER BY created_at"""
+                FROM users WHERE is_guest = 0
+                AND email NOT LIKE 'service+%@inkwell.internal' ORDER BY created_at"""
             ).fetchall()
         return [user for row in rows if (user := self._user(row)) is not None]
 
@@ -356,6 +381,21 @@ class Database:
         data.pop("storage_path", None)
         return data
 
+    def find_document_by_external_id(self, namespace: str, external_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM documents WHERE namespace = ? AND external_id = ?",
+                (namespace, external_id),
+            ).fetchone()
+        return self._document(row)
+
+    def list_processing_documents(self) -> list[str]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT document_id FROM documents WHERE status = 'processing' ORDER BY created_at"
+            ).fetchall()
+        return [row["document_id"] for row in rows]
+
     def find_document_by_hash(self, content_hash: str) -> dict[str, Any] | None:
         with self.connect() as connection:
             row = connection.execute(
@@ -364,14 +404,20 @@ class Database:
         return self._document(row)
 
     def create_document(self, document: dict[str, Any]) -> None:
-        values = {**document, "updated_at": document.get("updated_at") or document["created_at"]}
+        values = {
+            "namespace": "default",
+            "external_id": None,
+            **document,
+            "updated_at": document.get("updated_at") or document["created_at"],
+        }
         with self.connect() as connection:
             connection.execute(
                 """INSERT INTO documents
                 (document_id, filename, file_type, size_bytes, content_hash, storage_path,
-                 status, chunk_count, created_at, updated_at, error)
+                 status, chunk_count, created_at, updated_at, error, namespace, external_id)
                 VALUES (:document_id, :filename, :file_type, :size_bytes, :content_hash,
-                        :storage_path, :status, :chunk_count, :created_at, :updated_at, :error)""",
+                        :storage_path, :status, :chunk_count, :created_at, :updated_at, :error,
+                        :namespace, :external_id)""",
                 values,
             )
 
@@ -389,10 +435,11 @@ class Database:
             ).fetchone()
         return Path(row["storage_path"]) if row else None
 
-    def list_documents(self) -> list[dict[str, Any]]:
+    def list_documents(self, namespace: str = "default") -> list[dict[str, Any]]:
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM documents ORDER BY created_at DESC"
+                "SELECT * FROM documents WHERE namespace = ? ORDER BY created_at DESC",
+                (namespace,),
             ).fetchall()
         return [self._document(row) for row in rows]  # type: ignore[misc]
 
@@ -411,15 +458,21 @@ class Database:
         with self.connect() as connection:
             connection.execute("DELETE FROM documents WHERE document_id = ?", (document_id,))
 
-    def create_conversation(self, user_id: str, title: str = "New chat") -> dict[str, Any]:
+    def create_conversation(
+        self,
+        user_id: str,
+        title: str = "New chat",
+        namespace: str = "default",
+        external_user: str | None = None,
+    ) -> dict[str, Any]:
         conversation_id = str(uuid4())
         now = utc_now()
         with self.connect() as connection:
             connection.execute(
                 """INSERT INTO conversations
-                (conversation_id, title, created_at, updated_at, owner_id)
-                VALUES (?, ?, ?, ?, ?)""",
-                (conversation_id, title, now, now, user_id),
+                (conversation_id, title, created_at, updated_at, owner_id, namespace, external_user)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (conversation_id, title, now, now, user_id, namespace, external_user),
             )
         return {
             "conversation_id": conversation_id,
@@ -432,7 +485,8 @@ class Database:
     def list_conversations(self, user_id: str) -> list[dict[str, Any]]:
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM conversations WHERE owner_id = ? ORDER BY updated_at DESC",
+                """SELECT conversation_id, title, created_at, updated_at FROM conversations
+                WHERE owner_id = ? AND namespace = 'default' ORDER BY updated_at DESC""",
                 (user_id,),
             ).fetchall()
         return [dict(row) for row in rows]
@@ -446,7 +500,7 @@ class Database:
             if conversation is None:
                 return None
             messages = connection.execute(
-                "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at",
+                "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at, rowid",
                 (conversation_id,),
             ).fetchall()
         result = dict(conversation)
@@ -508,6 +562,31 @@ class Database:
                     "UPDATE conversations SET updated_at = ? WHERE conversation_id = ?",
                     (now, conversation_id),
                 )
+
+    def add_exchange(
+        self,
+        conversation_id: str,
+        user_id: str,
+        question: str,
+        answer: str,
+        sources: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Store a question and its answer together, so failures never leave orphans."""
+        self.add_message(conversation_id, user_id, "user", question)
+        self.add_message(conversation_id, user_id, "assistant", answer, sources)
+
+    def get_or_create_service_user(self, name: str) -> dict[str, Any]:
+        email = f"service+{name}@inkwell.internal"
+        existing = self.get_user_by_email(email)
+        if existing:
+            return existing
+        return self.create_user(
+            email=email,
+            display_name=f"Service: {name}",
+            password_hash="!service-account-no-login",
+            role="employee",
+            must_change_password=False,
+        )
 
     def prepare_regeneration(
         self, conversation_id: str, user_id: str, expected_question: str

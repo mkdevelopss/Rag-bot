@@ -11,6 +11,7 @@ class HealthResponse(BaseModel):
     llm_provider: str
     llm_model: str
     llm_configured: bool
+    agent_enabled: bool = True
 
 
 class DocumentResponse(BaseModel):
@@ -22,6 +23,7 @@ class DocumentResponse(BaseModel):
     chunk_count: int
     created_at: datetime
     error: str | None = None
+    external_id: str | None = None
 
 
 class UploadError(BaseModel):
@@ -35,6 +37,7 @@ class UploadBatchResponse(BaseModel):
 
 
 class SourceResponse(BaseModel):
+    number: int | None = None
     document_id: str
     filename: str
     page_number: int | None = None
@@ -49,10 +52,52 @@ class ChatRequest(BaseModel):
     regenerate: bool = False
 
 
+class AgentStep(BaseModel):
+    tool: str
+    message: str
+
+
 class ChatResponse(BaseModel):
     conversation_id: str
     answer: str
     sources: list[SourceResponse]
+    steps: list[AgentStep] = []
+
+
+NAMESPACE_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,63}$"
+
+
+class ServiceChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=10000)
+    conversation_id: str | None = None
+    # Your app's user id, so each end user only sees their own conversations.
+    user_ref: str | None = Field(default=None, max_length=200)
+    # Verified facts from your backend (user id, role, shop id...). Passed to app tools.
+    context: dict | None = None
+    stream: bool = False
+    regenerate: bool = False
+
+
+class TextDocumentRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=180)
+    text: str = Field(min_length=1, max_length=2_000_000)
+    # Stable id from your app (e.g. "faq-12", "product-991"). Re-sending it replaces the old version.
+    external_id: str | None = Field(default=None, max_length=200)
+
+
+class SearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=2000)
+    top_k: int | None = Field(default=None, ge=1, le=50)
+
+
+class SearchHit(BaseModel):
+    chunk_id: str
+    document_id: str
+    filename: str
+    page_number: int | None = None
+    text: str
+    similarity: float
+    score: float
 
 
 class ConversationSummary(BaseModel):
@@ -113,7 +158,7 @@ class SettingsUnlockResponse(BaseModel):
 
 
 class ProviderSettingsRequest(BaseModel):
-    provider: Literal["gemini", "groq"]
+    provider: Literal["gemini", "groq", "openai"]
     api_key: SecretStr | None = Field(default=None, max_length=500)
     model: str = Field(min_length=1, max_length=160)
 

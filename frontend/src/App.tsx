@@ -10,6 +10,7 @@ import Sidebar from "./components/layout/Sidebar";
 import SettingsPanel from "./components/ui/SettingsPanel";
 import { api, messageFromHistory, streamChat, uploadFiles } from "./services/api";
 import type {
+  Provider,
   AppSettings, AuthStatus, Conversation, DocumentRecord, Message, Source, UserRecord,
 } from "./types";
 
@@ -317,6 +318,10 @@ function Workspace({
           const sources = data.sources as Source[];
           setMessages((current) => current.map((item, index) =>
             index === assistantIndex ? { ...item, sources } : item));
+        } else if (event === "status" && typeof data.message === "string") {
+          const status = data.message;
+          setMessages((current) => current.map((item, index) =>
+            index === assistantIndex ? { ...item, status } : item));
         } else if (event === "delta" && typeof data.text === "string") {
           setMessages((current) => current.map((item, index) =>
             index === assistantIndex ? { ...item, content: item.content + data.text } : item));
@@ -419,7 +424,7 @@ function Workspace({
 
   async function saveProviderSettings(
     token: string,
-    provider: "gemini" | "groq",
+    provider: Provider,
     apiKey: string,
     model: string,
   ) {
@@ -501,7 +506,7 @@ function Workspace({
                 <span /> {currentUser.role === "admin" ? "API key needed" : "AI provider needs setup"}
               </button>
             )}
-            <button className="icon-button theme-toggle" title={darkMode ? "Switch to light theme" : "Switch to dark theme"} onClick={() => setDarkMode((value) => !value)}>
+            <button className="icon-button theme-toggle" title={darkMode ? "Switch to light theme" : "Switch to dark theme"} aria-label={darkMode ? "Switch to light theme" : "Switch to dark theme"} onClick={() => setDarkMode((value) => !value)}>
               {darkMode ? <Sun size={17} /> : <Moon size={17} />}
             </button>
             <div className="user-avatar-small" title={`${currentUser.display_name} (${currentUser.role})`}>{currentUser.display_name[0]?.toUpperCase() ?? "U"}</div>

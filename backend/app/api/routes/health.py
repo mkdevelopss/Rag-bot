@@ -14,4 +14,5 @@ def health(request: Request):
         llm_provider=settings.llm_provider,
         llm_model=settings.llm_model,
         llm_configured=bool(settings.llm_api_key),
+        agent_enabled=settings.agent_enabled,
     )

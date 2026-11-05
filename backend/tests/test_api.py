@@ -203,68 +203,6 @@ def test_admin_bootstrap_key_is_single_use_and_histories_stay_private(tmp_path, 
         get_settings.cache_clear()
 
 
-def test_stream_answer_cache_is_session_scoped_and_invalidated_by_documents(client):
-    from app.services.database import utc_now
-
-    source = {
-        "document_id": "cached-document",
-        "filename": "guide.pdf",
-        "page_number": 2,
-        "snippet": "The office opens at nine.",
-        "similarity": 0.9,
-        "chunk_id": "cached-document_0",
-    }
-    client.app.state.rag_pipeline.retrieve = lambda _question: ([source], "The office opens at nine.")
-
-    class FakeLLM:
-        def __init__(self):
-            self.calls = 0
-
-        def is_configured(self):
-            return True
-
-        def stream(self, _question, _context, _history):
-            self.calls += 1
-            yield "The office opens at nine."
-
-    llm = FakeLLM()
-    client.app.state.llm_service = llm
-
-    def ask(browser):
-        conversation = browser.post("/api/conversations", json={}).json()
-        return browser.post(
-            "/api/chat/stream",
-            json={
-                "message": "When does the office open?",
-                "conversation_id": conversation["conversation_id"],
-            },
-        )
-
-    assert ask(client).status_code == 200
-    assert ask(client).status_code == 200
-    assert llm.calls == 1
-
-    client.app.state.database.create_document({
-        "document_id": "cache-invalidation-document",
-        "filename": "new-guide.pdf",
-        "file_type": "PDF",
-        "size_bytes": 100,
-        "content_hash": "cache-invalidation-hash",
-        "storage_path": "unused",
-        "status": "ready",
-        "chunk_count": 1,
-        "created_at": utc_now(),
-        "error": None,
-    })
-    assert ask(client).status_code == 200
-    assert llm.calls == 2
-
-    with TestClient(client.app, headers={"X-Inkwell-Request": "1"}) as other_browser:
-        assert other_browser.get("/api/auth/status").status_code == 200
-        assert ask(other_browser).status_code == 200
-    assert llm.calls == 3
-
-
 def test_existing_conversations_are_assigned_to_the_first_admin(tmp_path):
     from app.services.database import Database, utc_now
 
@@ -468,143 +406,374 @@ def test_document_upload_status_duplicate_and_delete(client, monkeypatch):
     assert client.get(f"/api/documents/{document_id}").status_code == 404
 
 
-def test_streaming_chat_returns_grounded_fallback_without_matches(client, monkeypatch):
-    created = client.post("/api/conversations", json={}).json()
-    app = client.app
-    monkeypatch.setattr(
-        app.state.database,
-        "list_documents",
-        lambda: [{"status": "ready"}],
-    )
-    monkeypatch.setattr(app.state.rag_pipeline, "retrieve", lambda _query: ([], ""))
-    response = client.post(
-        "/api/chat/stream",
-        json={"message": "What does this say?", "conversation_id": created["conversation_id"]},
-    )
-    assert response.status_code == 200
-    assert "event: delta" in response.text
-    assert "uploaded documents" in response.text
-    history = client.get(f"/api/conversations/{created['conversation_id']}").json()["messages"]
-    assert [message["role"] for message in history] == ["user", "assistant"]
-    regenerated = client.post(
-        "/api/chat/stream",
-        json={
-            "message": "What does this say?",
-            "conversation_id": created["conversation_id"],
-            "regenerate": True,
-        },
-    )
-    assert regenerated.status_code == 200
-    history = client.get(f"/api/conversations/{created['conversation_id']}").json()["messages"]
-    assert [message["role"] for message in history] == ["user", "assistant"]
+# ---------------------------------------------------------------- chat + agent
+from types import SimpleNamespace
+
+from app.services.llm import ToolCall
 
 
-def test_streaming_chat_greeting_and_empty_library_prompt(client, monkeypatch):
-    def unexpected_retrieval(_query):
-        raise AssertionError("A greeting should not trigger document retrieval.")
+class ScriptedLLM:
+    """Plays back scripted rounds. Each round is a list of ("text", str) / ("tool_calls", [...])."""
 
-    monkeypatch.setattr(client.app.state.rag_pipeline, "retrieve", unexpected_retrieval)
-    created = client.post("/api/conversations", json={}).json()
-    response = client.post(
-        "/api/chat/stream",
-        json={"message": "hi", "conversation_id": created["conversation_id"]},
-    )
+    def __init__(self, rounds, configured=True):
+        self.rounds = list(rounds)
+        self.requests = []
+        self.configured = configured
 
-    assert response.status_code == 200
-    assert "Hi!" in response.text
-    assert "Upload a document first" in response.text
-    assert "event: done" in response.text
+    def is_configured(self):
+        return self.configured
 
-    monkeypatch.setattr(client.app.state.rag_pipeline, "retrieve", lambda _query: ([], ""))
-    no_documents = client.post(
-        "/api/chat/stream",
-        json={
-            "message": "Summarize it",
-            "conversation_id": created["conversation_id"],
-        },
-    )
-    assert "Please upload a document" in no_documents.text
+    def stream_chat(self, messages, tools=None):
+        self.requests.append({"messages": messages, "tools": tools})
+        yield from self.rounds.pop(0)
+
+    def stream_text(self, messages):
+        for kind, payload in self.stream_chat(messages):
+            if kind == "text":
+                yield payload
+
+    def complete(self, messages, max_tokens=1024):
+        self.requests.append({"messages": messages, "complete": True})
+        return "standalone query"
 
 
-def test_streaming_chat_returns_helpful_fallback_for_unmatched_document_question(
-    client, monkeypatch
-):
-    monkeypatch.setattr(
-        client.app.state.database,
-        "list_documents",
-        lambda: [{"status": "ready"}],
-    )
-    monkeypatch.setattr(client.app.state.rag_pipeline, "retrieve", lambda _query: ([], ""))
-    created = client.post("/api/conversations", json={}).json()
+def _ready_document(client, document_id="doc-1", namespace="default"):
+    from app.services.database import utc_now
 
-    response = client.post(
-        "/api/chat/stream",
-        json={
-            "message": "What is the weather?",
-            "conversation_id": created["conversation_id"],
-        },
-    )
-
-    assert "couldn't find that information" in response.text
-    assert "uploaded documents" in response.text
+    client.app.state.database.create_document({
+        "document_id": document_id, "filename": "policy.txt", "file_type": "TXT",
+        "size_bytes": 10, "content_hash": f"hash-{document_id}", "storage_path": "unused",
+        "status": "ready", "chunk_count": 1, "created_at": utc_now(), "error": None,
+        "namespace": namespace,
+    })
 
 
-def test_streaming_chat_explains_when_model_returns_no_text(client, monkeypatch):
-    source = {
-        "document_id": "doc-1",
-        "filename": "notes.pdf",
-        "page_number": 1,
-        "snippet": "The project has three phases.",
-        "similarity": 0.9,
-        "chunk_id": "doc-1_0",
+def _use_llm(client, llm):
+    client.app.state.llm_service = llm
+    client.app.state.agent.llm = llm
+    client.app.state.chat_service.llm = llm
+    client.app.state.chat_service.agent.llm = llm
+
+
+def _fake_search(client, monkeypatch, text="Refunds are allowed within 7 days."):
+    match = {
+        "chunk_id": "doc-1_0", "text": text, "document_id": "doc-1", "filename": "policy.txt",
+        "page_number": 2, "chunk_index": 0, "similarity": 0.9, "score": 0.03,
     }
+    calls = []
+
+    def search(query, namespace="default", top_k=None, document_ids=None, apply_threshold=True):
+        calls.append((query, namespace))
+        return [match]
+
+    monkeypatch.setattr(client.app.state.rag_pipeline, "search", search)
+    return calls
+
+
+def _events(text):
+    import json as _json
+
+    events = []
+    for block in text.strip().split("\n\n"):
+        lines = dict(line.split(": ", 1) for line in block.splitlines())
+        events.append((lines["event"], _json.loads(lines["data"])))
+    return events
+
+
+def test_agent_searches_cites_and_saves_the_exchange(client, monkeypatch):
+    _ready_document(client)
+    searches = _fake_search(client, monkeypatch)
+    llm = ScriptedLLM([
+        [("tool_calls", [ToolCall("c1", "search_knowledge_base", '{"query": "refund policy"}')])],
+        [("text", "You can get a refund within 7 days [1].")],
+    ])
+    _use_llm(client, llm)
+    response = client.post("/api/chat/stream", json={"message": "Can I get a refund?"})
+    events = _events(response.text)
+    kinds = [kind for kind, _ in events]
+    assert kinds[0] == "meta" and kinds[-1] == "done"
+    assert ("status", {"tool": "search_knowledge_base", "message": "Searching: refund policy"}) in events
+    final_sources = [data for kind, data in events if kind == "sources"][-1]["sources"]
+    assert final_sources[0]["number"] == 1 and final_sources[0]["filename"] == "policy.txt"
+    assert searches == [("refund policy", "default")]
+    tool_message = llm.requests[1]["messages"][-1]
+    assert tool_message["role"] == "tool" and "[1] (policy.txt, page 2)" in tool_message["content"]
+    conversation_id = events[0][1]["conversation_id"]
+    history = client.get(f"/api/conversations/{conversation_id}").json()["messages"]
+    assert [m["role"] for m in history] == ["user", "assistant"]
+    assert history[1]["content"] == "You can get a refund within 7 days [1]."
+    assert history[1]["sources"][0]["chunk_id"] == "doc-1_0"
+
+
+def test_follow_up_questions_send_history_to_the_agent(client, monkeypatch):
+    _ready_document(client)
+    _fake_search(client, monkeypatch)
+    llm = ScriptedLLM([
+        [("text", "Refunds take 7 days [1].")],
+        [("text", "It applies to all products.")],
+    ])
+    _use_llm(client, llm)
+    first = _events(client.post("/api/chat/stream", json={"message": "refund time?"}).text)
+    conversation_id = first[0][1]["conversation_id"]
+    client.post("/api/chat/stream", json={"message": "does it apply to phones?", "conversation_id": conversation_id})
+    sent = llm.requests[1]["messages"]
+    assert [m["role"] for m in sent[1:]] == ["user", "assistant", "user"]
+    assert sent[2]["content"] == "Refunds take 7 days [1]."
+
+
+def test_plain_rag_mode_rewrites_follow_ups_before_searching(client, monkeypatch):
+    _ready_document(client)
+    retrieved = []
     monkeypatch.setattr(
-        client.app.state.rag_pipeline,
-        "retrieve",
-        lambda _query: ([source], "The project has three phases."),
+        client.app.state.rag_pipeline, "retrieve",
+        lambda query, namespace="default", documents=None: (retrieved.append(query) or (
+            [{"number": 1, "document_id": "doc-1", "filename": "policy.txt", "page_number": None,
+              "snippet": "x", "similarity": 0.9, "chunk_id": "doc-1_0"}], "[1] (policy.txt)\nx")),
     )
-    monkeypatch.setattr(client.app.state.llm_service, "is_configured", lambda: True)
-    monkeypatch.setattr(client.app.state.llm_service, "stream", lambda *_args: iter(()))
-    created = client.post("/api/conversations", json={}).json()
-
-    response = client.post(
-        "/api/chat/stream",
-        json={
-            "message": "Summarize the project",
-            "conversation_id": created["conversation_id"],
-        },
-    )
-
-    assert "found relevant passages" in response.text
-    assert "event: done" in response.text
-    history = client.get(f"/api/conversations/{created['conversation_id']}").json()["messages"]
-    assert "found relevant passages" in history[-1]["content"]
+    settings = client.app.state.runtime_settings
+    settings.current = settings.current.model_copy(update={"agent_enabled": False})
+    llm = ScriptedLLM([[("text", "First [1].")], [("text", "Second [1].")]])
+    _use_llm(client, llm)
+    first = _events(client.post("/api/chat/stream", json={"message": "what is the refund window?"}).text)
+    client.post("/api/chat/stream", json={"message": "and for phones?", "conversation_id": first[0][1]["conversation_id"]})
+    assert retrieved == ["what is the refund window?", "standalone query"]
 
 
-def test_chat_endpoint_explains_when_model_returns_no_text(client, monkeypatch):
-    source = {
-        "document_id": "doc-1",
-        "filename": "notes.pdf",
-        "page_number": 1,
-        "snippet": "The project has three phases.",
-        "similarity": 0.9,
-        "chunk_id": "doc-1_0",
-    }
-    monkeypatch.setattr(
-        client.app.state.rag_pipeline,
-        "retrieve",
-        lambda _query: ([source], "The project has three phases."),
-    )
-    monkeypatch.setattr(client.app.state.llm_service, "stream", lambda *_args: iter(()))
-    created = client.post("/api/conversations", json={}).json()
+def test_greeting_and_empty_library_work_without_an_llm_key(client):
+    response = client.post("/api/chat/stream", json={"message": "hi"})
+    assert "Upload a document first" in response.text and "event: done" in response.text
+    response = client.post("/api/chat/stream", json={"message": "Summarize it"})
+    assert "Please upload a document" in response.text
 
-    response = client.post(
-        "/api/chat",
-        json={
-            "message": "Summarize the project",
-            "conversation_id": created["conversation_id"],
-        },
-    )
 
+def test_missing_llm_key_is_reported_before_streaming(client):
+    _ready_document(client)
+    response = client.post("/api/chat/stream", json={"message": "What is the refund policy?"})
+    assert response.status_code == 503
+    assert "GROQ_API_KEY" in response.json()["detail"]
+
+
+def test_llm_failure_does_not_leave_orphan_messages(client, monkeypatch):
+    from app.services.llm import LLMError
+
+    _ready_document(client)
+    _fake_search(client, monkeypatch)
+
+    class FailingLLM(ScriptedLLM):
+        def stream_chat(self, messages, tools=None):
+            raise LLMError("Groq rate limit reached.", 429)
+            yield  # pragma: no cover
+
+    _use_llm(client, FailingLLM([]))
+    response = client.post("/api/chat/stream", json={"message": "refund?"})
+    events = _events(response.text)
+    assert events[-1][0] == "error" and events[-1][1]["status_code"] == 429
+    conversation = client.get(f"/api/conversations/{events[0][1]['conversation_id']}").json()
+    assert conversation["messages"] == []
+
+
+def test_empty_model_output_is_explained(client, monkeypatch):
+    _ready_document(client)
+    _fake_search(client, monkeypatch)
+    _use_llm(client, ScriptedLLM([[]]))
+    response = client.post("/api/chat", json={"message": "Summarize the project"})
     assert response.status_code == 200
     assert "found relevant passages" in response.json()["answer"]
+
+
+def test_first_turn_answers_are_cached_and_invalidated_by_documents(client, monkeypatch):
+    _ready_document(client)
+    _fake_search(client, monkeypatch)
+    llm = ScriptedLLM([[("text", "Seven days [1].")], [("text", "Seven days [1].")]])
+    _use_llm(client, llm)
+    client.post("/api/chat/stream", json={"message": "Refund window?"})
+    client.post("/api/chat/stream", json={"message": "refund   window?"})
+    assert len(llm.requests) == 1
+    _ready_document(client, "doc-2")
+    client.post("/api/chat/stream", json={"message": "Refund window?"})
+    assert len(llm.requests) == 2
+
+
+def test_regenerate_replaces_the_last_answer(client, monkeypatch):
+    _ready_document(client)
+    _fake_search(client, monkeypatch)
+    _use_llm(client, ScriptedLLM([[("text", "First.")], [("text", "Second.")]]))
+    first = _events(client.post("/api/chat/stream", json={"message": "Refund window?"}).text)
+    conversation_id = first[0][1]["conversation_id"]
+    client.post("/api/chat/stream", json={"message": "Refund window?", "conversation_id": conversation_id, "regenerate": True})
+    messages = client.get(f"/api/conversations/{conversation_id}").json()["messages"]
+    assert [m["content"] for m in messages] == ["Refund window?", "Second."]
+
+
+def test_agent_falls_back_to_plain_rag_when_tools_are_rejected(client, monkeypatch):
+    from app.services.llm import LLMError
+
+    _ready_document(client)
+    monkeypatch.setattr(
+        client.app.state.rag_pipeline, "retrieve",
+        lambda query, namespace="default", documents=None: (
+            [{"number": 1, "document_id": "doc-1", "filename": "policy.txt", "page_number": None,
+              "snippet": "x", "similarity": 0.9, "chunk_id": "doc-1_0"}], "[1] (policy.txt)\nx"),
+    )
+
+    class NoToolsLLM(ScriptedLLM):
+        def stream_chat(self, messages, tools=None):
+            if tools:
+                raise LLMError("Groq rejected the request: tool calling is not supported", 400)
+            yield ("text", "Plain answer [1].")
+
+    _use_llm(client, NoToolsLLM([]))
+    response = client.post("/api/chat", json={"message": "refund?"})
+    assert response.json()["answer"] == "Plain answer [1]."
+
+
+def test_chat_rate_limit(client, monkeypatch):
+    settings = client.app.state.runtime_settings
+    settings.current = settings.current.model_copy(update={"chat_rate_limit_per_minute": 2})
+    assert client.post("/api/chat/stream", json={"message": "hi"}).status_code == 200
+    assert client.post("/api/chat/stream", json={"message": "hi"}).status_code == 200
+    assert client.post("/api/chat/stream", json={"message": "hi"}).status_code == 429
+
+
+# ------------------------------------------------------------------ service API
+@pytest.fixture
+def service_client(client):
+    from app.services.service_auth import ServiceKey, hash_service_key
+
+    client.app.state.service_keys = [
+        ServiceKey("marketbid", hash_service_key("mb-secret"), "marketbid"),
+        ServiceKey("distos", hash_service_key("ds-secret"), "distos-*"),
+    ]
+    return client
+
+
+def test_service_api_requires_key_and_enforces_namespace(service_client):
+    plain = TestClient(service_client.app)
+    assert plain.get("/api/v1/namespaces/marketbid/documents").status_code == 401
+    bad = {"Authorization": "Bearer wrong"}
+    assert plain.get("/api/v1/namespaces/marketbid/documents", headers=bad).status_code == 401
+    mb = {"Authorization": "Bearer mb-secret"}
+    ds = {"Authorization": "Bearer ds-secret"}
+    assert plain.get("/api/v1/namespaces/marketbid/documents", headers=mb).status_code == 200
+    assert plain.get("/api/v1/namespaces/distos-acme/documents", headers=mb).status_code == 403
+    assert plain.get("/api/v1/namespaces/distos-acme/documents", headers=ds).status_code == 200
+    assert plain.get("/api/v1/namespaces/Bad Name/documents", headers=ds).status_code in (403, 404, 422)
+
+
+def test_service_api_text_upsert_replaces_by_external_id(service_client, monkeypatch):
+    service = service_client.app.state.document_service
+    database = service_client.app.state.database
+    monkeypatch.setattr(service, "process_document", lambda document_id: database.update_document(document_id, status="ready", chunk_count=1, error=None))
+    api = TestClient(service_client.app, headers={"Authorization": "Bearer mb-secret"})
+    first = api.put("/api/v1/namespaces/marketbid/documents/text", json={"title": "Refund FAQ", "text": "7 days", "external_id": "faq-1"})
+    assert first.status_code == 202 and first.json()["external_id"] == "faq-1"
+    second = api.put("/api/v1/namespaces/marketbid/documents/text", json={"title": "Refund FAQ", "text": "10 days", "external_id": "faq-1"})
+    assert second.status_code == 202
+    docs = api.get("/api/v1/namespaces/marketbid/documents").json()
+    assert [doc["document_id"] for doc in docs] == [second.json()["document_id"]]
+    assert service_client.get("/api/documents").json() == []  # web UI library is separate
+    assert api.delete("/api/v1/namespaces/marketbid/documents/by-external-id/faq-1").status_code == 204
+    assert api.get("/api/v1/namespaces/marketbid/documents").json() == []
+
+
+def test_service_chat_passes_trusted_context_to_app_tools(service_client, monkeypatch):
+    from app.services.tools import HttpTool, NamespaceProfile
+    import app.services.agent as agent_module
+
+    profile = NamespaceProfile(
+        assistant_name="MarketBid Assistant",
+        tools=[HttpTool("get_repair_status", "Repair status", {"type": "object", "properties": {"request_id": {"type": "string"}}}, "http://marketbid.test/tools/status")],
+    )
+    service_client.app.state.agent.agent_config.profiles = {"marketbid": profile}
+    received = {}
+
+    def fake_call(tool, arguments, namespace, trusted_context):
+        received.update(tool=tool.name, arguments=arguments, namespace=namespace, context=trusted_context)
+        return '{"status": "technician assigned"}'
+
+    monkeypatch.setattr(agent_module, "call_http_tool", fake_call)
+    llm = ScriptedLLM([
+        [("tool_calls", [ToolCall("c1", "get_repair_status", '{"request_id": "R-55"}')])],
+        [("text", "Your repair R-55 has a technician assigned.")],
+    ])
+    _use_llm(service_client, llm)
+    api = TestClient(service_client.app, headers={"Authorization": "Bearer mb-secret"})
+    response = api.post("/api/v1/namespaces/marketbid/chat", json={
+        "message": "Where is my repair R-55?", "user_ref": "customer-9", "context": {"user_id": 9, "role": "customer"},
+    })
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["answer"] == "Your repair R-55 has a technician assigned."
+    assert body["steps"][0]["tool"] == "get_repair_status"
+    assert received == {"tool": "get_repair_status", "arguments": {"request_id": "R-55"}, "namespace": "marketbid", "context": {"user_id": 9, "role": "customer"}}
+    assert "MarketBid Assistant" in llm.requests[0]["messages"][0]["content"]
+    assert any(t["function"]["name"] == "get_repair_status" for t in llm.requests[0]["tools"])
+    conversation_id = body["conversation_id"]
+    assert api.get(f"/api/v1/namespaces/marketbid/conversations/{conversation_id}?user_ref=customer-9").status_code == 200
+    assert api.get(f"/api/v1/namespaces/marketbid/conversations/{conversation_id}?user_ref=customer-10").status_code == 404
+    other_user = api.post("/api/v1/namespaces/marketbid/chat", json={"message": "hi", "conversation_id": conversation_id, "user_ref": "customer-10"})
+    assert other_user.status_code == 404
+
+
+def test_end_to_end_upload_index_and_agent_answer(client):
+    from tests.test_services import FakeEmbeddings
+
+    fake = FakeEmbeddings()
+    client.app.state.document_service.embeddings = fake
+    client.app.state.rag_pipeline.embeddings = fake
+    text = (
+        "Screen repair price for Samsung A52 is 6500 PKR. Warranty is 30 days.\n\n"
+        "Order ORD-7781 was delivered to Gulberg. Refund requests are accepted within 7 days."
+    )
+    upload = client.post("/api/documents/upload", files={"files": ("shop.txt", text.encode(), "text/plain")})
+    assert upload.status_code == 201
+    document_id = upload.json()["documents"][0]["document_id"]
+    assert client.get(f"/api/documents/{document_id}").json()["status"] == "ready"
+
+    llm = ScriptedLLM([
+        [("tool_calls", [ToolCall("c1", "search_knowledge_base", '{"query": "ORD-7781 delivery"}')])],
+        [("text", "ORD-7781 was delivered to Gulberg [1].")],
+    ])
+    _use_llm(client, llm)
+    body = client.post("/api/chat", json={"message": "Where did ORD-7781 go?"}).json()
+    assert body["answer"] == "ORD-7781 was delivered to Gulberg [1]."
+    assert body["sources"][0]["document_id"] == document_id
+    assert "ORD-7781" in llm.requests[1]["messages"][-1]["content"]
+
+    assert client.delete(f"/api/documents/{document_id}").status_code == 204
+    assert client.app.state.vector_store.count_document_chunks(document_id) == 0
+
+
+def test_each_browser_sees_only_its_own_history_and_only_admins_manage_documents(client):
+    admin_chat = _events(client.post("/api/chat/stream", json={"message": "hi"}).text)[0][1]["conversation_id"]
+
+    with TestClient(client.app, headers={"X-Inkwell-Request": "1"}) as browser_a, \
+         TestClient(client.app, headers={"X-Inkwell-Request": "1"}) as browser_b:
+        assert browser_a.get("/api/auth/status").json()["user"]["role"] == "employee"
+        assert browser_b.get("/api/auth/status").status_code == 200
+        chat_a = _events(browser_a.post("/api/chat/stream", json={"message": "hello"}).text)[0][1]["conversation_id"]
+
+        # Nobody else can list, open, rename, delete, continue or regenerate it.
+        assert browser_b.get("/api/conversations").json() == []
+        assert browser_b.get(f"/api/conversations/{chat_a}").status_code == 404
+        assert browser_b.patch(f"/api/conversations/{chat_a}", json={"title": "x"}).status_code == 404
+        assert browser_b.delete(f"/api/conversations/{chat_a}").status_code == 404
+        assert browser_b.post("/api/chat/stream", json={"message": "hi", "conversation_id": chat_a}).status_code == 404
+        assert browser_b.post("/api/chat/stream", json={"message": "hello", "conversation_id": chat_a, "regenerate": True}).status_code == 404
+        assert browser_a.get(f"/api/conversations/{admin_chat}").status_code == 404
+        assert [c["conversation_id"] for c in browser_a.get("/api/conversations").json()] == [chat_a]
+
+        # Employees can read the shared library but never change it.
+        assert browser_a.get("/api/documents").status_code == 200
+        upload = browser_a.post("/api/documents/upload", files={"files": ("x.txt", b"secret", "text/plain")})
+        assert upload.status_code == 403
+        assert browser_a.delete("/api/documents/any-id").status_code == 403
+        assert browser_a.post("/api/documents/any-id/reprocess").status_code == 403
+        assert browser_a.post("/api/documents/reindex").status_code == 403
+        assert browser_a.patch("/api/settings", json={"top_k": 9}).status_code == 403
+        assert browser_a.get("/api/auth/users").status_code == 403
+
+    # Without a session there is no access at all, and service routes need a key.
+    anonymous = TestClient(client.app)
+    assert anonymous.get(f"/api/conversations/{chat_a}").status_code == 401
+    assert anonymous.get("/api/v1/namespaces/default/documents").status_code == 401

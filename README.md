@@ -1,4 +1,6 @@
-# Inkwell — document-grounded RAG chatbot
+# Inkwell — production RAG + agent
+
+> **v2:** hybrid search, a tool-calling agent, follow-up understanding, multi-tenant namespaces and a service API so other apps (MarketBid, DistributionOS) can use it as their AI backend. See [INTEGRATION.md](INTEGRATION.md) and [CHANGELOG.md](CHANGELOG.md).
 
 Inkwell is a single-company document Q&A workspace. Anyone who reaches the chat is automatically given an employee session for that browser; conversation histories stay private to that session. An administrator manages the shared document library and workspace settings. It extracts text from PDF, DOCX, TXT, Markdown, and CSV files, embeds overlapping text chunks locally, stores them in persistent ChromaDB, and retrieves relevant passages before asking Google Gemini or Groq to answer. Responses stream over Server-Sent Events and include source citations.
 
@@ -47,7 +49,7 @@ sequenceDiagram
 
 - **Frontend:** React, Vite, TypeScript, Tailwind CSS, Lucide React, React Markdown, remark-gfm
 - **API:** Python 3.14, FastAPI, Pydantic Settings, Uvicorn
-- **LLM:** official Google Gen AI Python SDK (`google-genai`) or official Groq Python SDK (`groq`), streaming responses
+- **LLM:** official `openai` Python SDK against each provider's OpenAI-compatible endpoint (Groq, Gemini, OpenAI, or any compatible server), streaming responses and tool calling
 - **Embeddings:** Sentence Transformers, default `sentence-transformers/all-MiniLM-L6-v2` (384-dimensional vectors)
 - **Vector store:** persistent local ChromaDB using cosine distance
 - **Conversation storage:** SQLite
@@ -193,12 +195,13 @@ Alternatively, double-click `start.bat` from the project root. It creates the Py
 
 1. The upload endpoint checks supported extensions, MIME type, and the configured maximum file size (20 MB by default); it sanitizes the display name and rejects duplicate file contents using SHA-256.
 2. The loader extracts text and PDF page numbers. Text is Unicode-normalized and whitespace-cleaned. CSV rows are represented as readable, pipe-separated text.
-3. Chunking defaults to 800 characters with 150 characters of overlap. Chunk size determines the passage length; overlap repeats boundary text so a sentence spanning two chunks is less likely to lose meaning. Both values can be changed in Settings. New uploads use current values; reprocess a document to rebuild its existing chunks.
+3. Chunking defaults to 800 characters with 150 characters of overlap. Chunks end on paragraph, line or sentence boundaries where possible (never mid-word), and overlaps start on a word. Both values can be changed in Settings. New uploads use current values; call `POST /api/documents/reindex` to rebuild every existing document after changing them.
 4. Sentence Transformers loads once per backend process. It produces normalized 384-dimensional vectors in batches, separately from ChromaDB storage.
-5. ChromaDB stores chunk text, vectors, and document/page/chunk metadata under `backend/data/chroma_db`, and survives restarts. Deleting a document also deletes its vectors and uploaded file.
-6. Questions use the same local embedding model. Chroma ranks chunks by cosine similarity; the configurable top-K and similarity threshold limit context. Context length is bounded and source information is attached to each excerpt.
-7. Standalone greetings receive a friendly reply without requiring a model call. If no document has finished indexing, the assistant asks the user to upload one. Summary prompts retrieve a broader set of the best-matching passages; other questions use the configured similarity threshold. If no relevant passage is found, the assistant clearly explains that it can only answer from uploaded documents. When passages are available, the selected provider receives the question, recent conversation turns, and retrieved excerpts (not the whole document library); its output streams as SSE deltas. Citations show the file, page when available, snippet, and similarity score.
-8. SQLite persists conversations, message history, document metadata, and UI-adjustable retrieval/chunking settings across restarts. Chat history is contextual only; document retrieval remains the factual source.
+5. ChromaDB stores chunk text, vectors, and document/page/chunk/namespace metadata under `backend/data/chroma_db`, and survives restarts. Writes are batched, so large documents index reliably. Deleting a document also deletes its vectors and uploaded file, including when it is deleted mid-ingestion. Documents left in `processing` by a restart are resumed automatically.
+6. **Hybrid retrieval.** Each search runs vector similarity *and* BM25 keyword search, then merges both rankings with reciprocal rank fusion. Keyword search catches exact tokens that embeddings miss: order numbers, SKUs, phone models, names. A chunk is kept if it passes the similarity threshold or is a strong keyword hit.
+7. **Agent mode (default).** The model decides what to do: search the knowledge base (rewriting follow-ups like "what about its price?" into standalone queries), list or read whole documents for summaries, or call your app's live tools. Answers cite numbered sources like `[1]`, and only the cited sources are shown. Set `AGENT_ENABLED=false` for classic single-search RAG (one LLM call; follow-ups are rewritten with a small extra call when `QUERY_REWRITE=true`). If a model rejects tool calling, the backend falls back to classic RAG automatically.
+8. Standalone greetings receive a friendly reply without a model call. If no document has finished indexing (and the namespace has no app tools), the assistant asks the user to upload one. A question and its answer are saved together only when the answer finishes, so failures never leave half-saved conversations; if the browser disconnects mid-answer, the partial answer is saved and marked as interrupted.
+9. SQLite persists conversations, message history, document metadata, and UI-adjustable retrieval/chunking settings across restarts. Chat history is contextual only; document retrieval remains the factual source.
 
 Uploaded file instructions are treated as untrusted reference content. Prompt injection protections are applied, but no prompt-based control can guarantee that a generative model will never make an unsupported statement; verify citations for consequential decisions.
 
@@ -208,7 +211,19 @@ Uploaded file instructions are treated as untrusted reference content. Prompt in
 
 | Variable | Default | Description |
 |---|---|---|
-| `LLM_PROVIDER` | `groq` | Active provider: `groq` or `gemini` |
+| `LLM_PROVIDER` | `groq` | Active provider: `groq`, `gemini` or `openai` (all via the OpenAI-compatible API) |
+| `OPENAI_API_KEY` / `OPENAI_MODEL` | empty / `gpt-5-mini` | OpenAI credentials and model |
+| `LLM_BASE_URL` | empty | Override endpoint for any OpenAI-compatible server (OpenRouter, Ollama, vLLM) |
+| `LLM_TIMEOUT_SECONDS` / `LLM_MAX_RETRIES` | `60` / `2` | Per-request timeout and automatic retries on 429/5xx |
+| `AGENT_ENABLED` | `true` | Tool-calling agent; `false` = classic single-search RAG |
+| `AGENT_MAX_STEPS` | `4` | Maximum model rounds (tool calls) per answer |
+| `AGENT_CONFIG_PATH` | `agent_config.json` | Per-namespace assistant name, instructions and app tools |
+| `QUERY_REWRITE` | `true` | Classic mode: rewrite follow-up questions before searching |
+| `HISTORY_MESSAGES` | `12` | Recent messages sent to the model |
+| `SERVICE_API_KEYS` | empty | Server-to-server keys: `name:sha256:namespace_glob`, comma-separated |
+| `CHAT_RATE_LIMIT_PER_MINUTE` | `30` | Messages per minute per user (or per service key + `user_ref`) |
+| `HYBRID_SEARCH` | `true` | Combine BM25 keyword search with vector search |
+| `EMBEDDING_QUERY_PREFIX` / `EMBEDDING_PASSAGE_PREFIX` | empty | Prefixes for models such as e5 (`query: ` / `passage: `) |
 | `GROQ_API_KEY` | empty | Backend-only Groq API key |
 | `GROQ_MODEL` | `openai/gpt-oss-120b` | Groq model identifier |
 | `GEMINI_API_KEY` | empty | Backend-only Google AI Studio API key |
@@ -220,7 +235,7 @@ Uploaded file instructions are treated as untrusted reference content. Prompt in
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | `800` / `150` | Default character chunking configuration |
 | `TOP_K` | `5` | Default maximum retrieved chunks |
 | `SIMILARITY_THRESHOLD` | `0.25` | Minimum cosine similarity |
-| `MAX_CONTEXT_CHARS` | `12000` | Maximum retrieved context passed to Gemini |
+| `MAX_CONTEXT_CHARS` | `12000` | Maximum retrieved context per answer (agent: half of this per tool call) |
 | `MAX_FILE_SIZE_MB` | `20` | Per-file upload limit |
 | `CORS_ORIGINS` | `http://localhost:5173` | Comma-separated allowed browser origins for direct API access |
 | `DATABASE_PATH` | `data/rag_chatbot.sqlite3` | SQLite storage path, relative to `backend` |
@@ -243,9 +258,11 @@ Settings changed through the UI are stored in SQLite and take precedence over ma
 | GET | `/api/documents` | List indexed and failed documents |
 | GET | `/api/documents/{document_id}` | Get document processing status |
 | DELETE | `/api/documents/{document_id}` | Remove file and all its vectors |
-| POST | `/api/documents/{document_id}/reprocess` | Rebuild chunks and vectors |
+| POST | `/api/documents/{document_id}/reprocess` | Rebuild chunks and vectors (runs in the background) |
+| POST | `/api/documents/reindex` | Rebuild every document, e.g. after changing chunk size or embedding model |
 | POST | `/api/chat` | Non-streaming chat response |
-| POST | `/api/chat/stream` | SSE stream: `meta`, `sources`, `delta`, `done`, or `error` |
+| POST | `/api/chat/stream` | SSE stream: `meta`, `status` (agent steps), `sources`, `delta`, `done`, or `error` |
+| * | `/api/v1/namespaces/{namespace}/...` | Service API for other apps; see [INTEGRATION.md](INTEGRATION.md) |
 | GET / POST | `/api/conversations` | List or create conversations |
 | GET / PATCH / DELETE | `/api/conversations/{conversation_id}` | Read, rename, or delete a conversation |
 | GET / PATCH | `/api/settings` | Read or update chunking and retrieval settings |
@@ -257,7 +274,16 @@ Browser state-changing API calls include an `X-Inkwell-Request` header to preven
 
 ## Answer cache
 
-Generated answers are cached in backend memory for up to 10 minutes, with a 512-entry limit. Cache keys include the browser-session owner, question, conversation history, retrieved context, document versions, and model/retrieval settings. A document upload, deletion, or reprocessing changes the document-version fingerprint, and provider or retrieval-setting changes also produce a different key. Retrieval still runs for every question so current source citations are returned; answers are never reused across browser sessions.
+First-turn answers (no conversation history) are cached in backend memory for up to 10 minutes, with a 512-entry limit, and shared by everyone in the same namespace, since everyone reads the same documents. A repeated FAQ such as "how do I place a bid?" is answered instantly and without spending provider quota. The key includes the namespace, the normalized question, every document's version, and the model and retrieval settings, so any upload, deletion or setting change invalidates it. Follow-ups, regenerations, requests with user context, and namespaces with live app tools are never cached.
+
+## Docker deployment
+
+```bash
+cp backend/.env.example backend/.env   # add your provider key, set AUTH_COOKIE_SECURE=true behind HTTPS
+docker compose up -d --build           # UI + API on http://localhost:8080
+```
+
+nginx serves the built UI and proxies `/api` to the backend with buffering off, so streaming works. Data (SQLite, Chroma, uploads, the embedding-model cache) lives in the `rag-data` volume. Generate the admin key inside the container with `docker compose exec backend python -m app.cli generate-admin-key`. Put the stack behind HTTPS (Caddy, Cloudflare Tunnel, or your host's proxy) before using company data.
 
 ## Tests and build
 
@@ -269,11 +295,11 @@ Set-Location frontend
 npm run build
 ```
 
-Tests mock the Gemini dependency where needed and do not require a Google key. Chroma persistence is exercised against a temporary directory.
+Install test tools with `pip install -r backend/requirements-dev.txt`. Tests script the LLM (including tool calls) and use a tiny fake embedding model, so they need no API key or model download. They exercise real Chroma storage, hybrid search, the agent loop, the service API and namespace isolation against temporary directories.
 
 ## Troubleshooting
 
-- **Provider API key missing:** set the matching `GROQ_API_KEY` or `GEMINI_API_KEY` in `backend/.env`, set `LLM_PROVIDER` accordingly, and restart Uvicorn. Document upload and retrieval work without a provider key, but generated answers need one.
+- **Provider API key missing:** set the matching `GROQ_API_KEY`, `GEMINI_API_KEY` or `OPENAI_API_KEY` in `backend/.env`, set `LLM_PROVIDER` accordingly, and restart Uvicorn. Document upload and retrieval work without a provider key, but generated answers need one.
 - **Model unavailable / quota exceeded:** check the selected provider's current model and rate-limit pages, then update the model on the Settings page. The former default `llama-3.3-70b-versatile` was retired for free and developer Groq accounts on August 16, 2026.
 - **First upload is slow:** the embedding model is downloaded and initialized on first use; subsequent operations reuse it.
 - **Python dependency wheel unavailable:** check the exact pip error and compatible package releases for Python 3.14 and your architecture. Do not silently downgrade Python.
@@ -285,5 +311,7 @@ Tests mock the Gemini dependency where needed and do not require a Google key. C
 
 - Scanned PDFs and images are not OCR-processed.
 - Files are stored unencrypted on local disk; protect the machine and backups accordingly.
-- Gemini free-tier limits, model access, and retention policies are set by Google and can change.
+- Provider free-tier limits, model access, and retention policies are set by each provider and can change. Agent mode uses 2–3 model calls per answer; on tight free tiers set `AGENT_ENABLED=false`.
+- Run the backend as a single worker process: the ingestion queue, rate limiter and answer cache live in memory. Scale up by moving them to Redis and Chroma to its server mode.
+- The keyword index is rebuilt in memory per namespace; it is fine for tens of thousands of chunks. For millions, move to a search engine with native hybrid search.
 - Chat titles are generated from the first user question; rename them from the conversation list.

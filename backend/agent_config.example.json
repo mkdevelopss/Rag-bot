@@ -1,0 +1,62 @@
+{
+  "namespaces": {
+    "default": {
+      "assistant_name": "Inkwell",
+      "instructions": "",
+      "tools": []
+    },
+    "marketbid": {
+      "assistant_name": "MarketBid Assistant",
+      "instructions": "You help customers and repair shops in Lahore on MarketBid. Prices are in PKR. Never promise a repair price that a shop hasn't bid. For account or payment problems, tell the user to contact support from the app.",
+      "tools": [
+        {
+          "name": "get_repair_request_status",
+          "description": "Get the live status, bids and assigned shop for one of the current user's repair requests.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "request_id": {"type": "string", "description": "Repair request id, e.g. RR-1042"}
+            },
+            "required": ["request_id"]
+          },
+          "url": "https://api.marketbid.example/internal/ai-tools/repair-request-status",
+          "method": "POST",
+          "secret_env": "MARKETBID_TOOL_SECRET",
+          "timeout_seconds": 10
+        }
+      ]
+    },
+    "distos-*": {
+      "assistant_name": "Distribution Assistant",
+      "instructions": "You help distributor staff, salesmen and retailers. Quantities are in units unless stated. Only report stock and order data returned by tools.",
+      "tools": [
+        {
+          "name": "check_stock",
+          "description": "Current stock level of a product in the user's warehouse.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "sku": {"type": "string", "description": "Product SKU or name"}
+            },
+            "required": ["sku"]
+          },
+          "url": "https://api.distos.example/internal/ai-tools/check-stock",
+          "secret_env": "DISTOS_TOOL_SECRET"
+        },
+        {
+          "name": "get_order_status",
+          "description": "Status, items and delivery date of an order the current user can see.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "order_id": {"type": "string"}
+            },
+            "required": ["order_id"]
+          },
+          "url": "https://api.distos.example/internal/ai-tools/order-status",
+          "secret_env": "DISTOS_TOOL_SECRET"
+        }
+      ]
+    }
+  }
+}

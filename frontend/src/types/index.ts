@@ -1,4 +1,7 @@
+export type Provider = "gemini" | "groq" | "openai";
+
 export type Source = {
+  number?: number;
   document_id: string;
   filename: string;
   page_number: number | null;
@@ -14,6 +17,7 @@ export type Message = {
   sources: Source[];
   created_at?: string;
   streaming?: boolean;
+  status?: string;
 };
 
 export type Conversation = {
@@ -43,7 +47,7 @@ export type AppSettings = {
   max_context_chars: number;
   max_file_size_mb: number;
   embedding_model: string;
-  llm_provider: "gemini" | "groq";
+  llm_provider: Provider;
   llm_model: string;
   provider_configured: boolean;
 };

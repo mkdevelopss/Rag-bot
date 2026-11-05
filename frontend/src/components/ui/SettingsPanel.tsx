@@ -1,6 +1,18 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { Check, KeyRound, LockKeyhole, LockOpen, ShieldCheck, SlidersHorizontal } from "lucide-react";
-import type { AppSettings } from "../../types";
+import type { AppSettings, Provider } from "../../types";
+
+const DEFAULT_MODELS: Record<Provider, string> = {
+  groq: "openai/gpt-oss-120b",
+  gemini: "gemini-3.8-flash",
+  openai: "gpt-5-mini",
+};
+
+const KEY_PAGES: Record<Provider, { url: string; label: string }> = {
+  groq: { url: "https://console.groq.com/keys", label: "Groq Console" },
+  gemini: { url: "https://aistudio.google.com/apikey", label: "Google AI Studio" },
+  openai: { url: "https://platform.openai.com/api-keys", label: "OpenAI Platform" },
+};
 
 type Props = {
   settings: AppSettings | null;
@@ -11,7 +23,7 @@ type Props = {
   onUnlock: (password: string) => Promise<string | null>;
   onSaveProvider: (
     token: string,
-    provider: "gemini" | "groq",
+    provider: Provider,
     apiKey: string,
     model: string,
   ) => Promise<void>;
@@ -22,7 +34,7 @@ export default function SettingsPanel({
   settings, isAdmin, busy, onSave, onUnlock, onSaveProvider, onLock, onClaimAdmin,
 }: Props) {
   const [draft, setDraft] = useState<AppSettings | null>(settings);
-  const [provider, setProvider] = useState<"gemini" | "groq">(settings?.llm_provider ?? "groq");
+  const [provider, setProvider] = useState<Provider>(settings?.llm_provider ?? "groq");
   const [model, setModel] = useState(settings?.llm_model ?? "openai/gpt-oss-120b");
   const [password, setPassword] = useState("");
   const [apiKey, setApiKey] = useState("");
@@ -126,9 +138,9 @@ export default function SettingsPanel({
     await onLock(token);
   }
 
-  function chooseProvider(nextProvider: "gemini" | "groq") {
+  function chooseProvider(nextProvider: Provider) {
     setProvider(nextProvider);
-    setModel(nextProvider === "groq" ? "openai/gpt-oss-120b" : "gemini-3.8-flash");
+    setModel(DEFAULT_MODELS[nextProvider]);
     setApiKey("");
   }
 
@@ -174,8 +186,8 @@ export default function SettingsPanel({
         <div className="model-detail"><span>Language model · {draft.llm_provider}</span><strong>{draft.llm_model}</strong><small>
           {draft.provider_configured ? "An API key is configured for this provider." : "No API key has been configured yet."}
           {" "}Get a key from{" "}
-          <a href={draft.llm_provider === "groq" ? "https://console.groq.com/keys" : "https://aistudio.google.com/apikey"} target="_blank" rel="noreferrer">
-            {draft.llm_provider === "groq" ? "Groq Console" : "Google AI Studio"}
+          <a href={KEY_PAGES[draft.llm_provider].url} target="_blank" rel="noreferrer">
+            {KEY_PAGES[draft.llm_provider].label}
           </a>.
         </small></div>
         <div className="model-detail"><span>Choose provider</span><small>
@@ -214,12 +226,13 @@ export default function SettingsPanel({
             <label className="provider-input">
               <span>Provider</span>
               <select value={provider} onChange={(event) => {
-                if (event.target.value === "gemini" || event.target.value === "groq") {
-                  chooseProvider(event.target.value);
+                if (event.target.value in DEFAULT_MODELS) {
+                  chooseProvider(event.target.value as Provider);
                 }
               }}>
                 <option value="groq">Groq</option>
                 <option value="gemini">Google Gemini</option>
+                <option value="openai">OpenAI</option>
               </select>
             </label>
             <label className="provider-input">
@@ -238,8 +251,8 @@ export default function SettingsPanel({
               />
               <small>
                 Get a key from{" "}
-                <a href={provider === "groq" ? "https://console.groq.com/keys" : "https://aistudio.google.com/apikey"} target="_blank" rel="noreferrer">
-                  {provider === "groq" ? "Groq Console" : "Google AI Studio"}
+                <a href={KEY_PAGES[provider].url} target="_blank" rel="noreferrer">
+                  {KEY_PAGES[provider].label}
                 </a>. Provider free quotas and model access vary by account.
               </small>
             </label>
