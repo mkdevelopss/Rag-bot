@@ -506,7 +506,7 @@ function Workspace({
                 <span /> {currentUser.role === "admin" ? "API key needed" : "AI provider needs setup"}
               </button>
             )}
-            <button className="icon-button theme-toggle" title={darkMode ? "Switch to light theme" : "Switch to dark theme"} onClick={() => setDarkMode((value) => !value)}>
+            <button className="icon-button theme-toggle" title={darkMode ? "Switch to light theme" : "Switch to dark theme"} aria-label={darkMode ? "Switch to light theme" : "Switch to dark theme"} onClick={() => setDarkMode((value) => !value)}>
               {darkMode ? <Sun size={17} /> : <Moon size={17} />}
             </button>
             <div className="user-avatar-small" title={`${currentUser.display_name} (${currentUser.role})`}>{currentUser.display_name[0]?.toUpperCase() ?? "U"}</div>
