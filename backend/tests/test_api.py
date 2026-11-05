@@ -742,3 +742,38 @@ def test_end_to_end_upload_index_and_agent_answer(client):
 
     assert client.delete(f"/api/documents/{document_id}").status_code == 204
     assert client.app.state.vector_store.count_document_chunks(document_id) == 0
+
+
+def test_each_browser_sees_only_its_own_history_and_only_admins_manage_documents(client):
+    admin_chat = _events(client.post("/api/chat/stream", json={"message": "hi"}).text)[0][1]["conversation_id"]
+
+    with TestClient(client.app, headers={"X-Inkwell-Request": "1"}) as browser_a, \
+         TestClient(client.app, headers={"X-Inkwell-Request": "1"}) as browser_b:
+        assert browser_a.get("/api/auth/status").json()["user"]["role"] == "employee"
+        assert browser_b.get("/api/auth/status").status_code == 200
+        chat_a = _events(browser_a.post("/api/chat/stream", json={"message": "hello"}).text)[0][1]["conversation_id"]
+
+        # Nobody else can list, open, rename, delete, continue or regenerate it.
+        assert browser_b.get("/api/conversations").json() == []
+        assert browser_b.get(f"/api/conversations/{chat_a}").status_code == 404
+        assert browser_b.patch(f"/api/conversations/{chat_a}", json={"title": "x"}).status_code == 404
+        assert browser_b.delete(f"/api/conversations/{chat_a}").status_code == 404
+        assert browser_b.post("/api/chat/stream", json={"message": "hi", "conversation_id": chat_a}).status_code == 404
+        assert browser_b.post("/api/chat/stream", json={"message": "hello", "conversation_id": chat_a, "regenerate": True}).status_code == 404
+        assert browser_a.get(f"/api/conversations/{admin_chat}").status_code == 404
+        assert [c["conversation_id"] for c in browser_a.get("/api/conversations").json()] == [chat_a]
+
+        # Employees can read the shared library but never change it.
+        assert browser_a.get("/api/documents").status_code == 200
+        upload = browser_a.post("/api/documents/upload", files={"files": ("x.txt", b"secret", "text/plain")})
+        assert upload.status_code == 403
+        assert browser_a.delete("/api/documents/any-id").status_code == 403
+        assert browser_a.post("/api/documents/any-id/reprocess").status_code == 403
+        assert browser_a.post("/api/documents/reindex").status_code == 403
+        assert browser_a.patch("/api/settings", json={"top_k": 9}).status_code == 403
+        assert browser_a.get("/api/auth/users").status_code == 403
+
+    # Without a session there is no access at all, and service routes need a key.
+    anonymous = TestClient(client.app)
+    assert anonymous.get(f"/api/conversations/{chat_a}").status_code == 401
+    assert anonymous.get("/api/v1/namespaces/default/documents").status_code == 401
